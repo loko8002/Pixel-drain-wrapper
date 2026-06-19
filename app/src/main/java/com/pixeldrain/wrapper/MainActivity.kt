@@ -67,6 +67,10 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val stopKeepAliveRunnable = Runnable { stopUploadKeepAlive() }
 
+    // Whether the page (incl. inner DOM scroll containers) is scrolled to the top.
+    // Pull-to-refresh is only allowed when true, so mid-scroll swipes never refresh.
+    private var pageAtTop = true
+
     private val baseUrl: String by lazy { getString(R.string.base_url) }
 
     // --- Activity result launchers -------------------------------------------
@@ -210,18 +214,16 @@ class MainActivity : AppCompatActivity() {
             onDownloadRequested(url, userAgent, contentDisposition, mimeType)
         }
 
-        // Native bridge the injected script calls when uploads start / finish.
-        binding.webView.addJavascriptInterface(UploadBridge(), JS_BRIDGE_NAME)
+        // Native bridge the injected scripts call (upload + scroll state).
+        binding.webView.addJavascriptInterface(NativeBridge(), JS_BRIDGE_NAME)
 
-        // Install the upload-detection hook before page scripts run, when the
-        // device's WebView supports document-start scripts (most modern devices).
+        // Install the page hooks before page scripts run, when the device's
+        // WebView supports document-start scripts (most modern devices).
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            val origins = setOf("https://pixeldrain.com", "https://*.pixeldrain.com")
             runCatching {
-                WebViewCompat.addDocumentStartJavaScript(
-                    binding.webView,
-                    UPLOAD_HOOK_JS,
-                    setOf("https://pixeldrain.com", "https://*.pixeldrain.com")
-                )
+                WebViewCompat.addDocumentStartJavaScript(binding.webView, UPLOAD_HOOK_JS, origins)
+                WebViewCompat.addDocumentStartJavaScript(binding.webView, SCROLL_HOOK_JS, origins)
             }
         }
 
@@ -419,10 +421,13 @@ class MainActivity : AppCompatActivity() {
                 showOffline()
             }
         }
-        // Only allow the swipe gesture when the WebView is scrolled to the top.
-        binding.swipeRefresh.setOnChildScrollUpCallback { _, _ ->
-            binding.webView.scrollY > 0
-        }
+        // Require a deliberate, longer pull so a glancing swipe can't trigger it.
+        binding.swipeRefresh.setDistanceToTriggerSync(
+            (resources.displayMetrics.density * REFRESH_TRIGGER_DP).toInt()
+        )
+        // Backstop for the gesture: only consider a refresh when the page (including
+        // inner scroll containers, tracked via JS) is genuinely at the top.
+        binding.swipeRefresh.setOnChildScrollUpCallback { _, _ -> !pageAtTop }
     }
 
     // --- Offline screen -------------------------------------------------------
@@ -510,13 +515,24 @@ class MainActivity : AppCompatActivity() {
     // --- Background uploads ---------------------------------------------------
 
     /**
-     * JavaScript bridge. The injected hook calls [onUploadStateChanged] whenever
-     * the number of in-flight file uploads transitions to/from zero.
+     * JavaScript bridge for the injected page hooks. [onUploadStateChanged] tracks
+     * in-flight uploads; [onScrollTopChanged] reports whether the effective scroll
+     * position (including inner DOM containers) is at the top.
      */
-    private inner class UploadBridge {
+    private inner class NativeBridge {
         @JavascriptInterface
         fun onUploadStateChanged(active: Boolean) {
             mainHandler.post { setUploadActive(active) }
+        }
+
+        @JavascriptInterface
+        fun onScrollTopChanged(atTop: Boolean) {
+            mainHandler.post {
+                pageAtTop = atTop
+                // Disable the whole gesture (not just the trigger) while scrolled
+                // down so a normal scroll can never be mistaken for a refresh pull.
+                binding.swipeRefresh.isEnabled = atTop
+            }
         }
     }
 
@@ -589,10 +605,15 @@ class MainActivity : AppCompatActivity() {
         override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
             binding.progressBar.isVisible = true
             binding.progressBar.progress = 0
+            // A fresh page starts at the top; the JS hook corrects this as the user
+            // scrolls. Re-enabling here also recovers if the bridge never fires.
+            pageAtTop = true
+            binding.swipeRefresh.isEnabled = true
             // Fallback for WebViews without document-start script support: the
-            // hook is idempotent (guards against double-install), so this is safe.
+            // hooks are idempotent (guard against double-install), so this is safe.
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
                 view.evaluateJavascript(UPLOAD_HOOK_JS, null)
+                view.evaluateJavascript(SCROLL_HOOK_JS, null)
             }
         }
 
@@ -670,6 +691,46 @@ class MainActivity : AppCompatActivity() {
         private const val JS_BRIDGE_NAME = "PixeldrainNative"
         private const val UPLOAD_STOP_DEBOUNCE_MS = 3_000L
         private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60 * 1000L
+
+        // Pull distance required to trigger a refresh (default is ~64dp).
+        private const val REFRESH_TRIGGER_DP = 120f
+
+        /**
+         * Injected before page scripts run. Reports whether the page is scrolled to
+         * the top to native, using a capture-phase scroll listener so it also sees
+         * Pixeldrain's inner scroll containers (whose scrolling never moves the
+         * WebView's own scrollY). Native uses this to enable pull-to-refresh only at
+         * the very top, preventing accidental refreshes during normal scrolling.
+         * Notifies only on state transitions to keep bridge traffic minimal.
+         */
+        private val SCROLL_HOOK_JS = """
+            (function () {
+              if (window.__pdScrollHookInstalled) return;
+              window.__pdScrollHookInstalled = true;
+
+              var lastAtTop = null;
+              function notify(atTop) {
+                if (atTop === lastAtTop) return;
+                lastAtTop = atTop;
+                try { PixeldrainNative.onScrollTopChanged(atTop); } catch (e) {}
+              }
+
+              function scrollTopOf(target) {
+                var el = target;
+                if (!el || el === document || el === window ||
+                    el === document.documentElement || el === document.body) {
+                  el = document.scrollingElement || document.documentElement || document.body;
+                }
+                return (el && typeof el.scrollTop === 'number') ? el.scrollTop : 0;
+              }
+
+              document.addEventListener('scroll', function (e) {
+                notify(scrollTopOf(e.target) <= 0);
+              }, true); // capture phase: catches inner scrollers too
+
+              notify(true);
+            })();
+        """.trimIndent()
 
         /**
          * Injected before page scripts run. Wraps XMLHttpRequest and fetch to
