@@ -27,6 +27,12 @@
     <color name="black">#000000</color>
     <color name="splash_background">#0E0E12</color>
 
-    <!-- Pull-to-refresh spinner background (themed in night variant). -->
-    <color name="refresh_bg">#FFFFFF</color>
+    <!-- WebView host chrome. Kept dark in both light/dark to match Pixeldrain's
+         dark UI, eliminate white flashes, and blend with the system bars. -->
+    <color name="page_background">#0C0C10</color>
+    <color name="page_on_surface">#ECEAF4</color>
+    <color name="page_on_surface_variant">#B6B4C4</color>
+
+    <!-- Pull-to-refresh spinner background — dark to match the host chrome. -->
+    <color name="refresh_bg">#1C1C24</color>
 </resources>

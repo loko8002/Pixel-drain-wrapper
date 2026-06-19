@@ -6,8 +6,13 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!-- Android 13+ runtime notification permission (download progress notifications). -->
+    <!-- Android 13+ runtime notification permission (download/upload notifications). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Keep in-page uploads alive while the app is backgrounded. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- Legacy storage only on API <= 28 so DownloadManager can write to public Downloads.
          On API 29+ scoped storage handles this with no permission. -->
@@ -55,6 +60,12 @@
                 <data android:scheme="https" android:host="pixeldrain.com" />
             </intent-filter>
         </activity>
+
+        <!-- Foreground service that keeps in-page uploads running in the background. -->
+        <service
+            android:name=".UploadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <!-- FileProvider for camera capture temp files during upload. -->
         <provider

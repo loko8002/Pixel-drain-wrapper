@@ -13,6 +13,11 @@
 
     <!-- Uploads / chooser -->
     <string name="choose_file">Select a file</string>
+    <string name="upload_channel_name">Uploads</string>
+    <string name="upload_channel_desc">Keeps file uploads running while the app is in the background.</string>
+    <string name="upload_notif_title">Uploading to Pixeldrain</string>
+    <string name="upload_notif_text">Keeping your upload running…</string>
+    <string name="upload_in_background">Upload will continue in the background</string>
 
     <!-- Offline / errors -->
     <string name="offline_title">You\'re offline</string>

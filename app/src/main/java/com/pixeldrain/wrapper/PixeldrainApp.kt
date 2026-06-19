@@ -16,24 +16,31 @@ class PixeldrainApp : Application() {
     override fun onCreate() {
         super.onCreate()
         DynamicColors.applyToActivitiesIfAvailable(this)
-        createDownloadNotificationChannel()
+        createNotificationChannels()
     }
 
-    private fun createDownloadNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                DOWNLOAD_CHANNEL_ID,
-                getString(R.string.download_channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = getString(R.string.download_channel_desc)
-            }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-        }
+    private fun createNotificationChannels() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val manager = getSystemService(NotificationManager::class.java)
+
+        val downloads = NotificationChannel(
+            DOWNLOAD_CHANNEL_ID,
+            getString(R.string.download_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        ).apply { description = getString(R.string.download_channel_desc) }
+
+        val uploads = NotificationChannel(
+            UPLOAD_CHANNEL_ID,
+            getString(R.string.upload_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        ).apply { description = getString(R.string.upload_channel_desc) }
+
+        manager.createNotificationChannel(downloads)
+        manager.createNotificationChannel(uploads)
     }
 
     companion object {
         const val DOWNLOAD_CHANNEL_ID = "pixeldrain_downloads"
+        const val UPLOAD_CHANNEL_ID = "pixeldrain_uploads"
     }
 }

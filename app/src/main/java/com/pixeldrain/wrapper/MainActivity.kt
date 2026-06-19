@@ -3,6 +3,7 @@ package com.pixeldrain.wrapper
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -10,10 +11,13 @@ import android.net.Uri
 import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
 import android.provider.MediaStore
 import android.view.HapticFeedbackConstants
-import android.view.View
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -25,12 +29,15 @@ import android.webkit.WebViewClient
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import com.google.android.material.snackbar.Snackbar
 import com.pixeldrain.wrapper.databinding.ActivityMainBinding
 import java.io.File
@@ -51,6 +58,14 @@ class MainActivity : AppCompatActivity() {
 
     // "Press back again to exit" state.
     private var backPressedAt = 0L
+
+    // Background-upload keep-alive state. While an in-page upload is running we
+    // must NOT pause the WebView's JS/timers and we keep a foreground service +
+    // wake lock alive so the transfer completes even when the app is backgrounded.
+    private var uploadActive = false
+    private var wakeLock: PowerManager.WakeLock? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val stopKeepAliveRunnable = Runnable { stopUploadKeepAlive() }
 
     private val baseUrl: String by lazy { getString(R.string.base_url) }
 
@@ -115,8 +130,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        binding.webView.onPause()
-        binding.webView.pauseTimers()
+        // Keep the WebView (and therefore the JS upload) running in the
+        // background while a transfer is in flight; otherwise pause to save power.
+        if (!uploadActive) {
+            binding.webView.onPause()
+            binding.webView.pauseTimers()
+        }
         connectivity.stop()
         super.onPause()
     }
@@ -128,6 +147,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // Release the upload keep-alive resources so nothing leaks.
+        mainHandler.removeCallbacks(stopKeepAliveRunnable)
+        stopUploadKeepAlive()
         // Detach and destroy to avoid leaking the WebView's context.
         binding.webView.apply {
             (parent as? android.view.ViewGroup)?.removeView(this)
@@ -176,10 +198,31 @@ class MainActivity : AppCompatActivity() {
             userAgentString = buildUserAgent(userAgentString)
         }
 
+        // Paint the WebView dark to match Pixeldrain's UI and avoid white flashes
+        // between the splash, page loads and navigations.
+        binding.webView.setBackgroundColor(
+            ContextCompat.getColor(this, R.color.page_background)
+        )
+
         binding.webView.webViewClient = PixeldrainWebViewClient()
         binding.webView.webChromeClient = PixeldrainChromeClient()
         binding.webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             onDownloadRequested(url, userAgent, contentDisposition, mimeType)
+        }
+
+        // Native bridge the injected script calls when uploads start / finish.
+        binding.webView.addJavascriptInterface(UploadBridge(), JS_BRIDGE_NAME)
+
+        // Install the upload-detection hook before page scripts run, when the
+        // device's WebView supports document-start scripts (most modern devices).
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            runCatching {
+                WebViewCompat.addDocumentStartJavaScript(
+                    binding.webView,
+                    UPLOAD_HOOK_JS,
+                    setOf("https://pixeldrain.com", "https://*.pixeldrain.com")
+                )
+            }
         }
 
         // Restore the saved WebView state if we were recreated.
@@ -444,12 +487,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun configureSystemBarIconContrast() {
-        val isLight = (resources.configuration.uiMode and
-            android.content.res.Configuration.UI_MODE_NIGHT_MASK) !=
-            android.content.res.Configuration.UI_MODE_NIGHT_YES
+        // The host chrome behind the system bars is intentionally dark (it matches
+        // Pixeldrain's dark UI), so we always use light status/navigation icons.
         WindowCompat.getInsetsController(window, window.decorView).apply {
-            isAppearanceLightStatusBars = isLight
-            isAppearanceLightNavigationBars = isLight
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
         }
     }
 
@@ -465,6 +507,77 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // --- Background uploads ---------------------------------------------------
+
+    /**
+     * JavaScript bridge. The injected hook calls [onUploadStateChanged] whenever
+     * the number of in-flight file uploads transitions to/from zero.
+     */
+    private inner class UploadBridge {
+        @JavascriptInterface
+        fun onUploadStateChanged(active: Boolean) {
+            mainHandler.post { setUploadActive(active) }
+        }
+    }
+
+    /**
+     * Reacts to upload activity. Starting is immediate; stopping is debounced so
+     * the foreground service doesn't flicker between chunked/sequential uploads.
+     */
+    private fun setUploadActive(active: Boolean) {
+        if (active) {
+            mainHandler.removeCallbacks(stopKeepAliveRunnable)
+            if (!uploadActive) startUploadKeepAlive()
+        } else {
+            mainHandler.removeCallbacks(stopKeepAliveRunnable)
+            mainHandler.postDelayed(stopKeepAliveRunnable, UPLOAD_STOP_DEBOUNCE_MS)
+        }
+    }
+
+    private fun startUploadKeepAlive() {
+        uploadActive = true
+        // Foreground service keeps the process from being frozen/killed so the
+        // WebView's JS upload keeps running while the app is in the background.
+        runCatching { UploadService.start(this) }
+        acquireUploadWakeLock()
+        Snackbar.make(
+            binding.root, getString(R.string.upload_in_background), Snackbar.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun stopUploadKeepAlive() {
+        if (!uploadActive) return
+        uploadActive = false
+        runCatching { UploadService.stop(this) }
+        releaseUploadWakeLock()
+        // If we deferred pausing the WebView while uploading and we're now in the
+        // background, settle back into the paused state to conserve power.
+        if (!isResumedState) {
+            binding.webView.onPause()
+            binding.webView.pauseTimers()
+        }
+    }
+
+    private val isResumedState: Boolean
+        get() = lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+
+    private fun acquireUploadWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK, "Pixeldrain:upload"
+        ).apply {
+            setReferenceCounted(false)
+            // Safety timeout so a missed "end" event can never pin the CPU forever.
+            acquire(WAKE_LOCK_TIMEOUT_MS)
+        }
+    }
+
+    private fun releaseUploadWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+    }
+
     // --- WebViewClient --------------------------------------------------------
 
     private inner class PixeldrainWebViewClient : WebViewClient() {
@@ -476,6 +589,11 @@ class MainActivity : AppCompatActivity() {
         override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
             binding.progressBar.isVisible = true
             binding.progressBar.progress = 0
+            // Fallback for WebViews without document-start script support: the
+            // hook is idempotent (guards against double-install), so this is safe.
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                view.evaluateJavascript(UPLOAD_HOOK_JS, null)
+            }
         }
 
         override fun onPageFinished(view: WebView, url: String?) {
@@ -547,5 +665,82 @@ class MainActivity : AppCompatActivity() {
         private const val PROGRESS_FADE_MS = 350L
         private const val MAX_SPLASH_MS = 2500L
         private const val APP_VERSION = "1.0.0"
+
+        // Background-upload tuning.
+        private const val JS_BRIDGE_NAME = "PixeldrainNative"
+        private const val UPLOAD_STOP_DEBOUNCE_MS = 3_000L
+        private const val WAKE_LOCK_TIMEOUT_MS = 30 * 60 * 1000L
+
+        /**
+         * Injected before page scripts run. Wraps XMLHttpRequest and fetch to
+         * count in-flight file uploads (requests whose body is a File/Blob/
+         * FormData/ArrayBuffer — not small JSON API calls) and notifies native
+         * when the active count crosses zero. Idempotent via an install guard.
+         */
+        private val UPLOAD_HOOK_JS = """
+            (function () {
+              if (window.__pdUploadHookInstalled) return;
+              window.__pdUploadHookInstalled = true;
+
+              var active = 0;
+              function notify() {
+                try { PixeldrainNative.onUploadStateChanged(active > 0); } catch (e) {}
+              }
+              function begin() { active++; notify(); }
+              function end() { active = Math.max(0, active - 1); notify(); }
+
+              function isUploadBody(body) {
+                if (!body) return false;
+                if (typeof FormData !== 'undefined' && body instanceof FormData) return true;
+                if (typeof Blob !== 'undefined' && body instanceof Blob) return true;
+                if (typeof File !== 'undefined' && body instanceof File) return true;
+                if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) return true;
+                if (body && body.buffer instanceof ArrayBuffer) return true;
+                return false;
+              }
+              function isWriteMethod(m) {
+                return /^(post|put|patch)${'$'}/i.test(String(m || ''));
+              }
+
+              // --- XMLHttpRequest ---
+              var origOpen = XMLHttpRequest.prototype.open;
+              var origSend = XMLHttpRequest.prototype.send;
+              XMLHttpRequest.prototype.open = function (method) {
+                this.__pdMethod = method;
+                return origOpen.apply(this, arguments);
+              };
+              XMLHttpRequest.prototype.send = function (body) {
+                if (isWriteMethod(this.__pdMethod) && isUploadBody(body)) {
+                  var done = false;
+                  var finish = function () { if (!done) { done = true; end(); } };
+                  begin();
+                  this.addEventListener('load', finish);
+                  this.addEventListener('error', finish);
+                  this.addEventListener('abort', finish);
+                  this.addEventListener('timeout', finish);
+                }
+                return origSend.apply(this, arguments);
+              };
+
+              // --- fetch ---
+              if (typeof window.fetch === 'function') {
+                var origFetch = window.fetch;
+                window.fetch = function (input, init) {
+                  var method = (init && init.method) ||
+                    (input && typeof input === 'object' && input.method) || 'GET';
+                  var body = (init && init.body) ||
+                    (input && typeof input === 'object' && input.body);
+                  if (isWriteMethod(method) && isUploadBody(body)) {
+                    begin();
+                    return origFetch.apply(this, arguments).then(
+                      function (r) { end(); return r; },
+                      function (e) { end(); throw e; }
+                    );
+                  }
+                  return origFetch.apply(this, arguments);
+                };
+              }
+            })();
+        """.trimIndent()
     }
 }
