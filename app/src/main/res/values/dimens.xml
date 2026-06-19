@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Spacing scale. -->
+    <dimen name="spacing_xs">4dp</dimen>
+    <dimen name="spacing_sm">8dp</dimen>
+    <dimen name="spacing_md">16dp</dimen>
+    <dimen name="spacing_lg">24dp</dimen>
+    <dimen name="spacing_xl">32dp</dimen>
+
+    <!-- Components. -->
+    <dimen name="progress_height">3dp</dimen>
+    <dimen name="button_corner">20dp</dimen>
+    <dimen name="offline_icon_size">96dp</dimen>
+</resources>

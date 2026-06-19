@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exposes the app cache dir to the camera app for capture-to-upload temp files. -->
+<paths>
+    <cache-path name="captures" path="." />
+    <files-path name="files" path="." />
+</paths>

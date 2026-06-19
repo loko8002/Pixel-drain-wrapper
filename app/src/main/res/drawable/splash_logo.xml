@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Splash icon: white droplet on transparent (the splash theme paints the
+     near-black background). Sized for the SplashScreen API icon window. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="160dp"
+    android:height="160dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,28 C54,28 36,50 36,66 a18,18 0 1 0 36,0 C72,50 54,28 54,28 Z" />
+    <path android:fillColor="#FF7C4DFF" android:pathData="M49,64h5v5h-5z" />
+    <path android:fillColor="#FF5B5BD6" android:pathData="M55,70h5v5h-5z" />
+</vector>

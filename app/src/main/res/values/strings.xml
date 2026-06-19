@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pixeldrain</string>
+
+    <!-- Note: base_url is also generated as a resValue in build.gradle.kts.
+         Defined here too as the canonical fallback; the build value wins. -->
+
+    <!-- Downloads -->
+    <string name="download_channel_name">Downloads</string>
+    <string name="download_channel_desc">Shows progress for files downloaded from Pixeldrain.</string>
+    <string name="download_in_progress">Downloading…</string>
+    <string name="download_started">Downloading “%1$s”</string>
+
+    <!-- Uploads / chooser -->
+    <string name="choose_file">Select a file</string>
+
+    <!-- Offline / errors -->
+    <string name="offline_title">You\'re offline</string>
+    <string name="offline_message">Check your connection and try again. We\'ll reconnect automatically.</string>
+    <string name="retry">Retry</string>
+    <string name="still_offline">Still offline — check your connection</string>
+    <string name="ssl_error">Secure connection failed</string>
+    <string name="no_app_to_open">No app available to open this link</string>
+
+    <!-- Navigation -->
+    <string name="press_back_again">Press back again to exit</string>
+</resources>

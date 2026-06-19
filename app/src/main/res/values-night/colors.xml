@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Refresh spinner background uses a dark surface at night. -->
+    <color name="refresh_bg">#141419</color>
+</resources>
