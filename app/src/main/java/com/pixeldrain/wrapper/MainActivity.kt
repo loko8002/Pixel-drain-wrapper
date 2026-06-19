@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.view.HapticFeedbackConstants
+import android.widget.Toast
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.SslErrorHandler
@@ -36,11 +37,15 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
+import androidx.documentfile.provider.DocumentFile
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.snackbar.Snackbar
 import com.pixeldrain.wrapper.databinding.ActivityMainBinding
 import java.io.File
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * Single-activity host for the Pixeldrain WebView. Owns the full WebView
@@ -73,11 +78,14 @@ class MainActivity : AppCompatActivity() {
 
     private val baseUrl: String by lazy { getString(R.string.base_url) }
 
+    // Background worker for folder enumeration (off the main thread).
+    private val ioExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+
     // --- Activity result launchers -------------------------------------------
 
     private val fileChooserLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            val callback = fileChooserCallback ?: return@registerForActivityResult
+            if (fileChooserCallback == null) return@registerForActivityResult
             val uris: Array<Uri>? = when {
                 result.resultCode != RESULT_OK -> null
                 // Camera capture path: data is null, file written to cameraImageUri.
@@ -86,9 +94,14 @@ class MainActivity : AppCompatActivity() {
                 else -> parseChooserResult(result.data)
             }
             // Always deliver a result (even null) or the web page hangs forever.
-            callback.onReceiveValue(uris)
-            fileChooserCallback = null
-            cameraImageUri = null
+            deliverChooserResult(uris)
+        }
+
+    private val folderPickerLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { treeUri ->
+            if (fileChooserCallback == null) return@registerForActivityResult
+            if (treeUri == null) deliverChooserResult(null)
+            else enumerateFolderAndDeliver(treeUri)
         }
 
     private val notificationPermissionLauncher =
@@ -154,6 +167,7 @@ class MainActivity : AppCompatActivity() {
         // Release the upload keep-alive resources so nothing leaks.
         mainHandler.removeCallbacks(stopKeepAliveRunnable)
         stopUploadKeepAlive()
+        ioExecutor.shutdownNow()
         // Detach and destroy to avoid leaking the WebView's context.
         binding.webView.apply {
             (parent as? android.view.ViewGroup)?.removeView(this)
@@ -288,17 +302,56 @@ class MainActivity : AppCompatActivity() {
         val acceptTypes = params.acceptTypes
             .filter { it.isNotBlank() }
             .ifEmpty { listOf("*/*") }
+        val allowMultiple =
+            params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
         val wantsCamera = params.isCaptureEnabled &&
             acceptTypes.any { it.startsWith("image/") }
 
+        // For multi-file inputs (Pixeldrain's uploader) let the user choose files,
+        // a whole folder, or the camera. Single-file inputs go straight to the picker.
+        return if (allowMultiple) {
+            showUploadSourceDialog(acceptTypes, wantsCamera)
+            true
+        } else {
+            launchFilePicker(acceptTypes, allowMultiple = false, wantsCamera = wantsCamera)
+        }
+    }
+
+    /** Bottom dialog offering Files / Folder / Camera for multi-file uploads. */
+    private fun showUploadSourceDialog(acceptTypes: List<String>, wantsCamera: Boolean) {
+        val labels = mutableListOf<String>()
+        val actions = mutableListOf<() -> Unit>()
+
+        labels += getString(R.string.upload_source_files)
+        actions += { launchFilePicker(acceptTypes, allowMultiple = true, wantsCamera = false) }
+
+        labels += getString(R.string.upload_source_folder)
+        actions += { launchFolderPicker() }
+
+        if (wantsCamera) {
+            labels += getString(R.string.upload_source_camera)
+            actions += { launchCamera() }
+        }
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.upload_source_title)
+            .setItems(labels.toTypedArray()) { _, which -> actions[which].invoke() }
+            // Dismissing without a choice must release the page's callback.
+            .setOnCancelListener { deliverChooserResult(null) }
+            .show()
+    }
+
+    /** Launches the system document picker for one or many files (+ optional camera). */
+    private fun launchFilePicker(
+        acceptTypes: List<String>,
+        allowMultiple: Boolean,
+        wantsCamera: Boolean
+    ): Boolean {
         val contentIntent = Intent(Intent.ACTION_GET_CONTENT).apply {
             type = if (acceptTypes.size == 1) acceptTypes.first() else "*/*"
             if (acceptTypes.size > 1) putExtra(Intent.EXTRA_MIME_TYPES, acceptTypes.toTypedArray())
             addCategory(Intent.CATEGORY_OPENABLE)
-            putExtra(
-                Intent.EXTRA_ALLOW_MULTIPLE,
-                params.mode == WebChromeClient.FileChooserParams.MODE_OPEN_MULTIPLE
-            )
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, allowMultiple)
         }
 
         val cameraIntent = if (wantsCamera) createCameraIntent() else null
@@ -315,10 +368,92 @@ class MainActivity : AppCompatActivity() {
             fileChooserLauncher.launch(chooser)
             true
         } catch (e: ActivityNotFoundException) {
-            fileChooserCallback?.onReceiveValue(null)
-            fileChooserCallback = null
+            deliverChooserResult(null)
             false
         }
+    }
+
+    private fun launchCamera() {
+        val intent = createCameraIntent()
+        if (intent == null) {
+            deliverChooserResult(null)
+            return
+        }
+        try {
+            fileChooserLauncher.launch(intent)
+        } catch (e: ActivityNotFoundException) {
+            deliverChooserResult(null)
+        }
+    }
+
+    private fun launchFolderPicker() {
+        try {
+            // null = let the picker choose its default starting location.
+            folderPickerLauncher.launch(null)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(this, R.string.folder_picker_unavailable, Toast.LENGTH_SHORT).show()
+            deliverChooserResult(null)
+        }
+    }
+
+    /**
+     * Recursively enumerates every file inside the chosen folder (off the main
+     * thread) and hands the flattened list back to the page's upload callback, so
+     * Pixeldrain uploads them all. Pixeldrain has no folder hierarchy, so the tree
+     * is intentionally flattened.
+     */
+    private fun enumerateFolderAndDeliver(treeUri: Uri) {
+        Snackbar.make(binding.root, R.string.folder_scanning, Snackbar.LENGTH_SHORT).show()
+        ioExecutor.execute {
+            val files = ArrayList<Uri>()
+            runCatching {
+                DocumentFile.fromTreeUri(this, treeUri)?.let { collectFiles(it, files) }
+            }
+            mainHandler.post {
+                // Activity may have gone away during the scan; just release the page.
+                if (isDestroyed || isFinishing) {
+                    deliverChooserResult(if (files.isEmpty()) null else files.toTypedArray())
+                    return@post
+                }
+                if (files.isEmpty()) {
+                    Toast.makeText(this, R.string.folder_empty, Toast.LENGTH_SHORT).show()
+                    deliverChooserResult(null)
+                } else {
+                    if (files.size >= MAX_FOLDER_FILES) {
+                        Toast.makeText(
+                            this,
+                            getString(R.string.folder_capped, MAX_FOLDER_FILES),
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } else {
+                        Snackbar.make(
+                            binding.root,
+                            getString(R.string.folder_files_selected, files.size),
+                            Snackbar.LENGTH_SHORT
+                        ).show()
+                    }
+                    deliverChooserResult(files.toTypedArray())
+                }
+            }
+        }
+    }
+
+    /** Depth-first collection of file URIs, capped at [MAX_FOLDER_FILES]. */
+    private fun collectFiles(dir: DocumentFile, out: MutableList<Uri>) {
+        for (child in dir.listFiles()) {
+            if (out.size >= MAX_FOLDER_FILES) return
+            when {
+                child.isDirectory -> collectFiles(child, out)
+                child.isFile -> out.add(child.uri)
+            }
+        }
+    }
+
+    /** Delivers the chosen URIs (or null) to the pending web file-chooser callback. */
+    private fun deliverChooserResult(uris: Array<Uri>?) {
+        fileChooserCallback?.onReceiveValue(uris)
+        fileChooserCallback = null
+        cameraImageUri = null
     }
 
     private fun createCameraIntent(): Intent? {
@@ -694,6 +829,9 @@ class MainActivity : AppCompatActivity() {
 
         // Pull distance required to trigger a refresh (default is ~64dp).
         private const val REFRESH_TRIGGER_DP = 120f
+
+        // Safety cap on how many files a single folder upload will collect.
+        private const val MAX_FOLDER_FILES = 1000
 
         /**
          * Injected before page scripts run. Reports whether the page is scrolled to

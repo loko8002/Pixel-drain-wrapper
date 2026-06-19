@@ -13,6 +13,15 @@
 
     <!-- Uploads / chooser -->
     <string name="choose_file">Select a file</string>
+    <string name="upload_source_title">Upload to Pixeldrain</string>
+    <string name="upload_source_files">Files</string>
+    <string name="upload_source_folder">Folder</string>
+    <string name="upload_source_camera">Camera</string>
+    <string name="folder_scanning">Scanning folder…</string>
+    <string name="folder_empty">That folder has no files</string>
+    <string name="folder_files_selected">Adding %1$d file(s) from folder</string>
+    <string name="folder_capped">Large folder — adding the first %1$d files</string>
+    <string name="folder_picker_unavailable">No folder picker available on this device</string>
     <string name="upload_channel_name">Uploads</string>
     <string name="upload_channel_desc">Keeps file uploads running while the app is in the background.</string>
     <string name="upload_notif_title">Uploading to Pixeldrain</string>
